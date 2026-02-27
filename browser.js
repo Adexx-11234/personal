@@ -1,17 +1,23 @@
-require('dotenv').config();
-const puppeteer = require('puppeteer');
 const fs = require('fs');
 const { BASE_URL, PORTAL_URL, COOKIES_FILE } = require('./config');
+
 const IVAS_EMAIL = process.env.IVAS_EMAIL || '';
 const IVAS_PASSWORD = process.env.IVAS_PASSWORD || '';
 const LOGIN_URL = `${BASE_URL}/login`;
 
+// ============================================================
+// STATE — browser stays open so fetcher can use page.evaluate
+// ============================================================
 let browser = null;
 let page = null;
 let csrfToken = null;
 let sessionCookies = [];
 let sessionValid = false;
+let pageReady = false;  // true when page is idle and safe to use
 
+// ============================================================
+// COOKIE HELPERS
+// ============================================================
 function loadCookies() {
     try {
         if (fs.existsSync(COOKIES_FILE)) {
@@ -31,102 +37,54 @@ function saveCookies(cookies) {
     } catch (err) { console.error('Error saving cookies:', err.message); }
 }
 
-function getCookies() { return sessionCookies; }
-function getCsrfToken() { return csrfToken; }
-function isSessionValid() { return sessionValid; }
-function getCookieHeader() { return sessionCookies.map(c => `${c.name}=${c.value}`).join('; '); }
+function getCookies()      { return sessionCookies; }
+function getCsrfToken()    { return csrfToken; }
+function isSessionValid()  { return sessionValid; }
+function isPageReady()     { return pageReady; }
+function getPage()         { return page; }
+function getBrowser()      { return browser; }
 
-async function waitForCloudflare(pg, maxWaitMs = 60000) {
-    console.log('⏳ Waiting for Cloudflare...');
+function getCookieHeader() {
+    return sessionCookies.map(c => `${c.name}=${c.value}`).join('; ');
+}
+
+// ============================================================
+// CLOUDFLARE WAIT — just waits, turnstile:true auto-clicks
+// ============================================================
+async function waitForCloudflare(pg, maxWaitMs = 40000) {
+    console.log('⏳ Waiting for Cloudflare to clear...');
     const start = Date.now();
 
     while (Date.now() - start < maxWaitMs) {
         try {
             const isCf = await pg.evaluate(() => {
                 const body = document.body?.innerText?.toLowerCase() || '';
+                const title = document.title.toLowerCase();
                 return (
+                    title.includes('just a moment') ||
                     body.includes('performing security verification') ||
                     body.includes('checking your browser') ||
-                    body.includes('verify you are human') ||
-                    document.title.toLowerCase().includes('just a moment')
+                    body.includes('verify you are human')
                 );
             });
 
             if (!isCf) { console.log('✅ Cloudflare cleared!'); return true; }
-
-            // Find the CF iframe and click inside it with human-like mouse movement
-            const frames = pg.frames();
-            for (const frame of frames) {
-                try {
-                    const frameUrl = frame.url();
-                    if (!frameUrl.includes('cloudflare') && !frameUrl.includes('challenges')) continue;
-
-                    // Get checkbox position in the iframe
-                    const checkbox = await frame.$('input[type="checkbox"], .ctp-checkbox-label, #cf-stage');
-                    if (checkbox) {
-                        const box = await checkbox.boundingBox();
-                        if (box) {
-                            // Move mouse to checkbox with human-like curve
-                            await humanMouseMove(pg, box.x + box.width / 2, box.y + box.height / 2);
-                            await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
-                            await pg.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-                            console.log('🖱️ Clicked CF checkbox in iframe');
-                            await new Promise(r => setTimeout(r, 3000));
-                        }
-                    }
-                } catch (e) {}
-            }
-
-            // Also try clicking the turnstile widget directly on the page
-            try {
-                const cfWidget = await pg.$('iframe[src*="cloudflare"], iframe[src*="challenges"]');
-                if (cfWidget) {
-                    const box = await cfWidget.boundingBox();
-                    if (box) {
-                        // Click roughly where the checkbox is (left side of widget)
-                        const clickX = box.x + 30;
-                        const clickY = box.y + box.height / 2;
-                        await humanMouseMove(pg, clickX, clickY);
-                        await new Promise(r => setTimeout(r, 150 + Math.random() * 200));
-                        await pg.mouse.click(clickX, clickY);
-                        console.log('🖱️ Clicked CF iframe widget');
-                        await new Promise(r => setTimeout(r, 3000));
-                    }
-                }
-            } catch (e) {}
-
         } catch (e) {}
 
+        process.stdout.write('.');
         await new Promise(r => setTimeout(r, 2000));
     }
 
-    console.log('⚠️ CF timeout — please click manually');
+    console.log('\n⚠️ CF wait timeout — continuing anyway');
     return false;
 }
 
-// Human-like mouse movement (bezier curve)
-async function humanMouseMove(pg, targetX, targetY) {
-    const startX = Math.random() * 400 + 100;
-    const startY = Math.random() * 300 + 100;
-    const steps = 20 + Math.floor(Math.random() * 15);
-
-    await pg.mouse.move(startX, startY);
-
-    for (let i = 0; i <= steps; i++) {
-        const t = i / steps;
-        // Bezier curve with random control point
-        const cpX = (startX + targetX) / 2 + (Math.random() - 0.5) * 100;
-        const cpY = (startY + targetY) / 2 + (Math.random() - 0.5) * 100;
-        const x = (1 - t) * (1 - t) * startX + 2 * (1 - t) * t * cpX + t * t * targetX;
-        const y = (1 - t) * (1 - t) * startY + 2 * (1 - t) * t * cpY + t * t * targetY;
-        await pg.mouse.move(x + (Math.random() - 0.5) * 2, y + (Math.random() - 0.5) * 2);
-        await new Promise(r => setTimeout(r, 10 + Math.random() * 20));
-    }
-}
-
+// ============================================================
+// AUTO LOGIN
+// ============================================================
 async function doLogin(pg) {
     if (!IVAS_EMAIL || !IVAS_PASSWORD) {
-        console.log('⚠️ No IVAS_EMAIL/IVAS_PASSWORD in .env — skipping auto login');
+        console.log('⚠️ No IVAS_EMAIL/IVAS_PASSWORD — skipping auto login');
         return false;
     }
 
@@ -134,7 +92,6 @@ async function doLogin(pg) {
         console.log('🔑 Navigating to login page...');
         await pg.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: 60000 });
         await new Promise(r => setTimeout(r, 2000));
-
         await waitForCloudflare(pg, 20000);
         await new Promise(r => setTimeout(r, 1000));
 
@@ -142,10 +99,7 @@ async function doLogin(pg) {
             !!(document.querySelector('input[type="email"], input[name="email"]'))
         );
 
-        if (!hasForm) {
-            console.log('⚠️ Login form not visible');
-            return false;
-        }
+        if (!hasForm) { console.log('⚠️ Login form not visible'); return false; }
 
         // Fill email
         await pg.click('input[type="email"], input[name="email"]', { clickCount: 3 });
@@ -159,7 +113,7 @@ async function doLogin(pg) {
 
         console.log('📝 Credentials entered — clicking Log in...');
 
-       // Click login button
+        // Click with realClick (puppeteer-real-browser), fallback to evaluate
         try {
             await pg.realClick('button[type="submit"]');
         } catch (e) {
@@ -168,6 +122,7 @@ async function doLogin(pg) {
                 if (submit) submit.click();
             });
         }
+
         await pg.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 2000));
         await waitForCloudflare(pg, 15000);
@@ -180,7 +135,7 @@ async function doLogin(pg) {
                 const err = document.querySelector('.alert-danger, .error-message, .invalid-feedback');
                 return err ? err.textContent.trim() : 'Unknown error';
             });
-            console.log('❌ Still on login page. Error:', error);
+            console.log('❌ Still on login page:', error);
             return false;
         }
 
@@ -193,21 +148,32 @@ async function doLogin(pg) {
     }
 }
 
+// ============================================================
+// INIT BROWSER
+// Note: browser stays OPEN — fetcher uses page.evaluate()
+// to make POST requests in the browser context, avoiding 403
+// ============================================================
 async function initBrowser() {
     try {
         console.log('🚀 Launching Puppeteer Real Browser...');
+        pageReady = false;
 
-        if (browser) { try { await browser.close(); } catch (e) {} browser = null; page = null; }
+        if (browser) {
+            try { await browser.close(); } catch (e) {}
+            browser = null; page = null;
+        }
 
         const { connect } = require('puppeteer-real-browser');
 
         const { browser: rb, page: rp } = await connect({
-            headless: true,
+            headless: false,
             args: ['--no-sandbox', '--disable-dev-shm-usage'],
-            customConfig: {},
+            customConfig: {
+                chromePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+            },
             turnstile: true,
             connectOption: { defaultViewport: null },
-            disableXvfb: false,   // true for Windows, false for Linux
+            disableXvfb: process.platform === 'win32',
             ignoreAllFlags: false,
         });
 
@@ -229,8 +195,9 @@ async function initBrowser() {
             await page.goto(BASE_URL + '/portal', { waitUntil: 'load', timeout: 90000 });
         } catch (e) { console.log('⚠️ Page load timeout, continuing...'); }
 
-        // Wait for CF to auto-solve (turnstile:true handles it)
-        await new Promise(r => setTimeout(r, 5000));
+        // Wait for CF (turnstile:true auto-handles it)
+        await waitForCloudflare(page, 40000);
+        await new Promise(r => setTimeout(r, 2000));
 
         // Check if logged in
         let isLoggedIn = await page.evaluate(() =>
@@ -239,21 +206,20 @@ async function initBrowser() {
                window.location.href.includes('/portal'))
         ).catch(() => false);
 
-        // Not logged in — try auto login
         if (!isLoggedIn) {
-            console.log('🔒 Not logged in, trying auto login...');
+            console.log('🔒 Not logged in — trying auto login...');
             const loginOk = await doLogin(page);
 
             if (loginOk) {
                 await page.goto(BASE_URL + '/portal', { waitUntil: 'networkidle2', timeout: 30000 });
                 await new Promise(r => setTimeout(r, 3000));
+                await waitForCloudflare(page, 10000);
 
                 isLoggedIn = await page.evaluate(() =>
                     !!(document.querySelector('.user-panel') && window.location.href.includes('/portal'))
                 ).catch(() => false);
             }
 
-            // Wait for manual login if auto failed
             if (!isLoggedIn) {
                 console.log('\n⚠️ Auto login failed — waiting for manual login (90s)...');
                 let waited = 0;
@@ -277,7 +243,7 @@ async function initBrowser() {
 
         console.log('\n✅ Portal authenticated!');
 
-        // Get CSRF token
+        // Navigate to SMS page and extract CSRF token
         await page.goto(PORTAL_URL, { waitUntil: 'networkidle2', timeout: 30000 });
         await new Promise(r => setTimeout(r, 2000));
 
@@ -295,15 +261,9 @@ async function initBrowser() {
         csrfToken = token;
         saveCookies(await page.cookies());
         sessionValid = true;
-        console.log('✅ CSRF token extracted, session ready!');
+        pageReady = true;
 
-        // Close browser — HTTP takes over
-        await new Promise(r => setTimeout(r, 500));
-        try { await browser.close(); } catch (e) {}
-        browser = null;
-        page = null;
-        console.log('🔒 Browser closed — switching to HTTP mode');
-
+        console.log('✅ CSRF token extracted — browser staying open for HTTP requests');
         return true;
 
     } catch (err) {
@@ -313,17 +273,49 @@ async function initBrowser() {
     }
 }
 
+// ============================================================
+// Navigate page back to SMS received (used by fetcher)
+// ============================================================
+async function ensureOnSmsPage() {
+    if (!page) return false;
+    try {
+        const url = page.url();
+        if (!url.includes('/portal/sms/received')) {
+            await page.goto(PORTAL_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+            await new Promise(r => setTimeout(r, 1500));
+            // Refresh CSRF
+            const token = await page.evaluate(() => {
+                const meta = document.querySelector('meta[name="csrf-token"]');
+                return meta ? meta.getAttribute('content') : null;
+            });
+            if (token) csrfToken = token;
+        }
+        return true;
+    } catch (e) { return false; }
+}
+
 function setSessionCookies(cookies) {
     sessionCookies = cookies;
     saveCookies(cookies);
     csrfToken = null;
     sessionValid = false;
+    pageReady = false;
 }
 
 function setCsrfToken(token) { csrfToken = token; }
 
 module.exports = {
-    initBrowser, loadCookies, saveCookies,
-    getCookies, getCsrfToken, setCsrfToken,
-    isSessionValid, getCookieHeader, setSessionCookies,
+    initBrowser,
+    loadCookies,
+    saveCookies,
+    getCookies,
+    getCsrfToken,
+    setCsrfToken,
+    isSessionValid,
+    isPageReady,
+    getCookieHeader,
+    setSessionCookies,
+    getPage,
+    getBrowser,
+    ensureOnSmsPage,
 };
